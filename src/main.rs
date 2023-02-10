@@ -21,10 +21,8 @@ async fn main() -> Result<()> {
     futures_util::pin_mut!(tweets_stream);
     tweets_stream
         .for_each(|tweet_result| {
-            match tweet_result {
-                Ok(tweet) => println!("{}", serde_json::to_string(&tweet).unwrap()),
-                Err(e) => eprintln!("{:?}", e),
-            }
+            let tweet = tweet_result.unwrap();
+            println!("{}", serde_json::to_string(&tweet).unwrap());
             futures_util::future::ready(())
         })
         .await;

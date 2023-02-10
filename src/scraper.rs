@@ -1,4 +1,4 @@
-use std::collections::{HashMap, VecDeque};
+use std::collections::{BTreeMap, VecDeque};
 use std::sync::Arc;
 
 use anyhow::{anyhow, Result};
@@ -295,8 +295,8 @@ fn parse_tweets(json: Value) -> Result<(Vec<Value>, String)> {
 
     #[derive(Deserialize)]
     struct GlobalObjects {
-        tweets: HashMap<String, Value>,
-        users: HashMap<String, Value>,
+        tweets: BTreeMap<String, Value>,
+        users: BTreeMap<String, Value>,
     }
 
     let root: Root = serde_json::from_value(json)?;
@@ -313,7 +313,7 @@ fn parse_tweets(json: Value) -> Result<(Vec<Value>, String)> {
             }
         }
     }
-    let tweets: Vec<_> = tweets.into_iter().map(|(_, tweet)| tweet).collect();
+    let tweets: Vec<_> = tweets.into_iter().map(|(_, tweet)| tweet).rev().collect();
 
     // Parse cursor
     let timeline_str = serde_json::to_string(&root.timeline)?;
