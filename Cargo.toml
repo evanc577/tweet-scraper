@@ -14,3 +14,4 @@ tokio = { version = "1.25.0", features = ["process", "time", "sync"] }
 url = "2.3.1"
 futures-util = "0.3.26"
 regex = "1.7.1"
+clap = { version = "4.1.4", features = ["derive"] }
