@@ -1,20 +1,22 @@
 use std::collections::{BTreeMap, VecDeque};
 use std::sync::Arc;
+use std::time::Duration;
 
 use anyhow::{anyhow, Result};
-use chromiumoxide::cdp::browser_protocol::fetch;
-use chromiumoxide::cdp::browser_protocol::network::CookieParam;
-use chromiumoxide::{Browser, BrowserConfig, Page};
+use chromiumoxide::cdp::browser_protocol::network::{Cookie, SetUserAgentOverrideParams};
+use chromiumoxide::{Browser, BrowserConfig};
 use futures_util::stream::StreamExt;
 use futures_util::Stream;
+use reqwest::header::{self, HeaderMap, HeaderValue};
+use reqwest::{Client, StatusCode};
 use serde::Deserialize;
 use serde_json::Value;
 use url::Url;
+use once_cell::sync::Lazy;
 
 pub struct TweetScraper {
     #[allow(dead_code)]
-    browser: Browser,
-    page: Arc<Page>,
+    client: Client,
 
     fetch_state: FetchState,
 }
@@ -31,13 +33,55 @@ struct FetchState {
     errored: bool,
 }
 
+#[derive(Debug)]
+struct BrowserData {
+    cookies: Vec<Cookie>,
+}
+
+static USER_AGENT: &str = "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/109.0.0.0 Safari/537.36";
+static ACCEPT_VALUE: &str = "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,image/apng,*/*;q=0.8,application/signed-exchange;v=b3;q=0.9";
+static AUTHORIZATION_VALUE: &str = "Bearer AAAAAAAAAAAAAAAAAAAAANRILgAAAAAAnNwIzUejRCOuH5E6I8xnZz4puTs%3D1Zv7ttfk8LF81IUq16cHjhLTvJu4FA33AGWWjCpTnA";
+
 impl TweetScraper {
     pub async fn initialize() -> Result<Self> {
-        let mut browser = setup_browser().await?;
-        let page = setup_interception(&mut browser).await?;
+        let browser_data = browser_data().await?;
+        let headers = {
+            let mut headers = HeaderMap::new();
+            headers.insert(header::ACCEPT, HeaderValue::from_static(ACCEPT_VALUE));
+            headers.insert(
+                header::ACCEPT_ENCODING,
+                HeaderValue::from_static("gzip, deflate, br"),
+            );
+            headers.insert(
+                header::ACCEPT_LANGUAGE,
+                HeaderValue::from_static("en-US,en;q=0.9"),
+            );
+            headers.insert(
+                header::UPGRADE_INSECURE_REQUESTS,
+                HeaderValue::from_static("1"),
+            );
+            headers.insert(
+                header::AUTHORIZATION,
+                HeaderValue::from_static(AUTHORIZATION_VALUE),
+            );
+            let guest_token = &browser_data
+                .cookies
+                .iter()
+                .find(|c| c.name == "gt")
+                .ok_or_else(|| anyhow!("no guest token"))?
+                .value;
+            headers.insert("x-guest-token", HeaderValue::from_str(guest_token)?);
+            headers
+        };
+        let client = Client::builder()
+            .user_agent(USER_AGENT)
+            .default_headers(headers)
+            .gzip(true)
+            .brotli(true)
+            .deflate(true)
+            .build()?;
         Ok(Self {
-            browser,
-            page,
+            client,
             fetch_state: Default::default(),
         })
     }
@@ -106,7 +150,7 @@ impl TweetScraper {
 
             // Scrape Twitter
             match query_twitter(
-                state.page.clone(),
+                &state.client,
                 state.fetch_state.query.as_str(),
                 state.fetch_state.cursor.as_deref(),
             )
@@ -134,8 +178,9 @@ impl TweetScraper {
     }
 }
 
-async fn setup_browser() -> Result<Browser> {
-    let (browser, mut handler) = Browser::launch(
+/// Get cookies for twitter.com
+async fn browser_data() -> Result<BrowserData> {
+    let (mut browser, mut handler) = Browser::launch(
         BrowserConfig::builder()
             // Sometimes twitter webpage hangs if window is larger???
             .window_size(800, 600)
@@ -144,13 +189,9 @@ async fn setup_browser() -> Result<Browser> {
     )
     .await?;
 
-    tokio::task::spawn(async move { while handler.next().await.is_some() {} });
+    let browser_handler =
+        tokio::task::spawn(async move { while handler.next().await.is_some() {} });
 
-    Ok(browser)
-}
-
-/// Setup request interception to add headers
-async fn setup_interception(browser: &mut Browser) -> Result<Arc<Page>> {
     let page = Arc::new(
         browser
             .start_incognito_context()
@@ -159,114 +200,23 @@ async fn setup_interception(browser: &mut Browser) -> Result<Arc<Page>> {
             .await?,
     );
 
-    // First navigate to website to extract cookies
+    page.set_user_agent(SetUserAgentOverrideParams::new(USER_AGENT))
+        .await?;
+
+    // Navigate to website to extract cookies
     page.goto("https://twitter.com/explore").await?;
     page.wait_for_navigation().await?;
 
-    let cookies: Vec<_> = page
-        .get_cookies()
-        .await?
-        .into_iter()
-        .map(|c| {
-            CookieParam::builder()
-                .name(c.name)
-                .value(c.value)
-                .domain("api.twitter.com")
-                .build()
-                .unwrap()
-        })
-        .collect();
+    let cookies = page.get_cookies().await?;
 
-    let guest_token = cookies
-        .iter()
-        .find(|c| c.name == "gt")
-        .ok_or_else(|| anyhow!("no guest token"))?
-        .value
-        .clone();
+    browser.close().await?;
+    browser_handler.await?;
 
-    page.goto("about:blank").await?;
-    page.wait_for_navigation().await?;
-
-    page.set_cookies(cookies).await?;
-
-    page.execute(fetch::EnableParams {
-        patterns: vec![
-            fetch::RequestPattern {
-                url_pattern: "https://api.twitter.com/2/search/adaptive.json*"
-                    .to_string()
-                    .into(),
-                resource_type: None,
-                request_stage: fetch::RequestStage::Request.into(),
-            },
-            fetch::RequestPattern {
-                url_pattern: "https://api.twitter.com/2/search/adaptive.json*"
-                    .to_string()
-                    .into(),
-                resource_type: None,
-                request_stage: fetch::RequestStage::Response.into(),
-            },
-        ]
-        .into(),
-        handle_auth_requests: None,
-    })
-    .await?;
-
-    let mut request_paused = page
-        .event_listener::<fetch::EventRequestPaused>()
-        .await
-        .unwrap();
-    let intercept_page = page.clone();
-    tokio::task::spawn(async move {
-        while let Some(event) = request_paused.next().await {
-            match (*event).clone() {
-                fetch::EventRequestPaused {
-                    response_status_code: Some(status_code),
-                    ..
-                } => {
-                    let headers: Vec<fetch::HeaderEntry> = Vec::new();
-                    let f = fetch::FulfillRequestParams::builder()
-                        .request_id(event.request_id.clone())
-                        .response_headers(headers)
-                        .response_code(status_code)
-                        .build()
-                        .unwrap();
-                    intercept_page.execute(f).await.unwrap();
-                }
-                _ => {
-                    let mut headers = vec![];
-                    for (k, v) in event.request.headers.inner().as_object().unwrap() {
-                        headers.push(fetch::HeaderEntry {
-                            name: k.clone(),
-                            value: v.as_str().unwrap().into(),
-                        })
-                    }
-                    let he = fetch::HeaderEntry {
-                        name: "authorization".into(),
-                        value: "Bearer AAAAAAAAAAAAAAAAAAAAANRILgAAAAAAnNwIzUejRCOuH5E6I8xnZz4puTs%3D1Zv7ttfk8LF81IUq16cHjhLTvJu4FA33AGWWjCpTnA".into()
-                    };
-                    headers.push(he);
-                    let he = fetch::HeaderEntry {
-                        name: "x-guest-token".into(),
-                        value: guest_token.clone(),
-                    };
-                    headers.push(he);
-
-                    let c = fetch::ContinueRequestParams::builder()
-                        .request_id(event.request_id.clone())
-                        .headers(headers)
-                        .build()
-                        .unwrap();
-                    intercept_page.execute(c).await.unwrap();
-                }
-            }
-        }
-    });
-
-    Ok(page)
+    Ok(BrowserData { cookies })
 }
 
 async fn query_twitter(
-    page: Arc<Page>,
+    client: &Client,
     query: impl AsRef<str>,
     cursor: Option<&str>,
 ) -> Result<(Vec<Value>, String)> {
@@ -308,19 +258,24 @@ async fn query_twitter(
         url.query_pairs_mut().append_pair("cursor", cursor);
     }
 
-    page.goto(url.as_str()).await?;
-    page.wait_for_navigation().await?;
-    let content = page.content().await?;
+    static RETRY_STATUS: Lazy<Vec<StatusCode>> = Lazy::new(|| {
+        [StatusCode::TOO_MANY_REQUESTS, StatusCode::REQUEST_TIMEOUT].into()
+    });
+    let json = loop {
+        let response = client.get(url.as_str()).send().await?;
+        if response.status().is_success() {
+            break response.json::<Value>().await?;
+        }
 
-    let re = regex::Regex::new(r"\{.*\}").unwrap();
-    let json = re
-        .find(&content)
-        .ok_or_else(|| anyhow!("no json found"))?
-        .as_str()
-        .to_owned();
+        if response.status().is_server_error() || RETRY_STATUS.contains(&response.status()) {
+            eprintln!("received response status code: {}, waiting 60 seconds", response.status().as_u16());
+            tokio::time::sleep(Duration::from_secs(60)).await;
+        } else {
+            return Err(anyhow!("error status code {}", response.status().as_u16()));
+        }
+    };
 
-    let value = serde_json::from_str(&json)?;
-    parse_tweets(value)
+    parse_tweets(json)
 }
 
 fn parse_tweets(json: Value) -> Result<(Vec<Value>, String)> {
