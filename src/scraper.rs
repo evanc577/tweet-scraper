@@ -16,10 +16,16 @@ pub struct TweetScraper {
     browser: Browser,
     page: Arc<Page>,
 
-    // State during stream iteration
+    fetch_state: FetchState,
+}
+
+// State during stream iteration
+#[derive(Default)]
+struct FetchState {
     tweets: VecDeque<Value>,
     query: String,
     limit: Option<usize>,
+    min_id: Option<u128>,
     tweets_count: usize,
     cursor: Option<String>,
     errored: bool,
@@ -32,12 +38,7 @@ impl TweetScraper {
         Ok(Self {
             browser,
             page,
-            tweets: Default::default(),
-            query: Default::default(),
-            limit: None,
-            tweets_count: 0,
-            cursor: Default::default(),
-            errored: false,
+            fetch_state: Default::default(),
         })
     }
 
@@ -45,50 +46,87 @@ impl TweetScraper {
         &'a mut self,
         query: impl AsRef<str>,
         limit: Option<usize>,
+        min_id: Option<u128>,
     ) -> impl Stream<Item = Result<Value>> + 'a {
-        self.tweets.clear();
-        self.query = query.as_ref().into();
-        self.limit = limit;
-        self.tweets_count = 0;
-        self.cursor = None;
-        self.errored = false;
+        // Reset internal state
+        self.fetch_state = FetchState {
+            query: query.as_ref().to_owned(),
+            limit,
+            min_id,
+            ..Default::default()
+        };
 
         futures_util::stream::unfold(self, |state| async {
-            if state.errored {
+            // Stop if previously errored
+            if state.fetch_state.errored {
                 return None;
             }
 
-            if let Some(limit) = state.limit {
-                if state.tweets_count >= limit {
+            // Stop if limit number reached
+            if let Some(limit) = state.fetch_state.limit {
+                if state.fetch_state.tweets_count >= limit {
                     return None;
                 }
             }
 
-            if let Some(tweet) = state.tweets.pop_front() {
-                state.tweets_count += 1;
-                return Some((Ok(tweet), state));
+            let mut should_return_tweet = |tweet| {
+                // Stop if minimum tweet id reached
+                if let Some(min_id) = state.fetch_state.min_id {
+                    let parse_id = |tweet: &Value| -> Result<u128> {
+                        let id = tweet["id_str"]
+                            .as_str()
+                            .ok_or_else(|| anyhow!("no id_str"))?
+                            .parse()?;
+                        Ok(id)
+                    };
+                    match parse_id(&tweet) {
+                        Ok(id) => {
+                            if id < min_id {
+                                return None;
+                            }
+                        }
+                        Err(e) => {
+                            state.fetch_state.errored = true;
+                            return Some(Err(e));
+                        }
+                    }
+                }
+
+                // Return next tweet
+                state.fetch_state.tweets_count += 1;
+                Some(Ok(tweet))
+            };
+
+            // Try returning the next tweet if available
+            if let Some(tweet) = state.fetch_state.tweets.pop_front() {
+                if let Some(r) = should_return_tweet(tweet) {
+                    return Some((r, state));
+                }
             }
 
+            // Scrape Twitter
             match query_twitter(
                 state.page.clone(),
-                state.query.as_str(),
-                state.cursor.as_deref(),
+                state.fetch_state.query.as_str(),
+                state.fetch_state.cursor.as_deref(),
             )
             .await
             {
                 Ok((tweets, cursor)) => {
-                    state.tweets.extend(tweets.into_iter());
-                    state.cursor = Some(cursor);
+                    state.fetch_state.tweets.extend(tweets.into_iter());
+                    state.fetch_state.cursor = Some(cursor);
                 }
                 Err(e) => {
-                    state.errored = true;
+                    state.fetch_state.errored = true;
                     return Some((Err(e), state));
                 }
             }
 
-            if let Some(tweet) = state.tweets.pop_front() {
-                state.tweets_count += 1;
-                return Some((Ok(tweet), state));
+            // Try returning the next tweet if available
+            if let Some(tweet) = state.fetch_state.tweets.pop_front() {
+                if let Some(r) = should_return_tweet(tweet) {
+                    return Some((r, state));
+                }
             }
 
             None
@@ -97,9 +135,9 @@ impl TweetScraper {
 }
 
 async fn setup_browser() -> Result<Browser> {
-    // Spawn browser
     let (browser, mut handler) = Browser::launch(
         BrowserConfig::builder()
+            // Sometimes twitter webpage hangs if window is larger???
             .window_size(800, 600)
             .build()
             .map_err(|s| anyhow!(s))?,

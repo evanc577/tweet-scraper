@@ -10,6 +10,9 @@ struct Args {
 
     #[arg(short, long)]
     limit: Option<usize>,
+
+    #[arg(short, long)]
+    min_id: Option<u128>,
 }
 
 #[tokio::main]
@@ -17,7 +20,7 @@ async fn main() {
     let args = Args::parse();
 
     let mut scraper = TweetScraper::initialize().await.unwrap();
-    let tweets_stream = scraper.tweets(args.query, args.limit).await;
+    let tweets_stream = scraper.tweets(args.query, args.limit, args.min_id).await;
     futures_util::pin_mut!(tweets_stream);
     while let Some(tweet_result) = tweets_stream.next().await {
         let tweet = tweet_result.unwrap();
