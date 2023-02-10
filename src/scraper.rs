@@ -1,4 +1,4 @@
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
 use std::sync::Arc;
 
 use anyhow::{anyhow, Result};
@@ -6,6 +6,7 @@ use chromiumoxide::cdp::browser_protocol::fetch;
 use chromiumoxide::cdp::browser_protocol::network::CookieParam;
 use chromiumoxide::{Browser, BrowserConfig, Page};
 use futures_util::stream::StreamExt;
+use futures_util::Stream;
 use serde::Deserialize;
 use serde_json::Value;
 use url::Url;
@@ -14,25 +15,84 @@ pub struct TweetScraper {
     #[allow(dead_code)]
     browser: Browser,
     page: Arc<Page>,
+
+    // State during stream iteration
+    tweets: VecDeque<Value>,
+    query: String,
+    limit: Option<usize>,
+    tweets_count: usize,
+    cursor: Option<String>,
+    errored: bool,
 }
 
 impl TweetScraper {
     pub async fn initialize() -> Result<Self> {
         let mut browser = setup_browser().await?;
         let page = setup_interception(&mut browser).await?;
-        Ok(Self { browser, page })
+        Ok(Self {
+            browser,
+            page,
+            tweets: Default::default(),
+            query: Default::default(),
+            limit: None,
+            tweets_count: 0,
+            cursor: Default::default(),
+            errored: false,
+        })
     }
 
-    pub async fn tweets(
-        &mut self,
+    pub async fn tweets<'a>(
+        &'a mut self,
         query: impl AsRef<str>,
         limit: Option<usize>,
-    ) -> Result<Vec<Value>> {
-        let json = query_twitter(self.page.clone(), query).await?;
-        let value = serde_json::from_str(&json)?;
-        let tweets = parse_tweets(value)?;
+    ) -> impl Stream<Item = Result<Value>> + 'a {
+        self.tweets.clear();
+        self.query = query.as_ref().into();
+        self.limit = limit;
+        self.tweets_count = 0;
+        self.cursor = None;
+        self.errored = false;
 
-        Ok(tweets)
+        futures_util::stream::unfold(self, |state| async {
+            if state.errored {
+                return None;
+            }
+
+            if let Some(limit) = state.limit {
+                if state.tweets_count >= limit {
+                    return None;
+                }
+            }
+
+            if let Some(tweet) = state.tweets.pop_front() {
+                state.tweets_count += 1;
+                return Some((Ok(tweet), state));
+            }
+
+            match query_twitter(
+                state.page.clone(),
+                state.query.as_str(),
+                state.cursor.as_deref(),
+            )
+            .await
+            {
+                Ok((tweets, cursor)) => {
+                    state.tweets.extend(tweets.into_iter());
+                    state.cursor = Some(cursor);
+                }
+                Err(e) => {
+                    state.errored = true;
+                    return Some((Err(e), state));
+                }
+            }
+
+            if let Some(tweet) = state.tweets.pop_front() {
+                state.tweets_count += 1;
+                return Some((Ok(tweet), state));
+            }
+
+            None
+        })
     }
 }
 
@@ -167,7 +227,11 @@ async fn setup_interception(browser: &mut Browser) -> Result<Arc<Page>> {
     Ok(page)
 }
 
-async fn query_twitter(page: Arc<Page>, query: impl AsRef<str>) -> Result<String> {
+async fn query_twitter(
+    page: Arc<Page>,
+    query: impl AsRef<str>,
+    cursor: Option<&str>,
+) -> Result<(Vec<Value>, String)> {
     static URL: &str = "https://api.twitter.com/2/search/adaptive.json";
 
     let mut url = Url::parse(URL)?;
@@ -202,6 +266,10 @@ async fn query_twitter(page: Arc<Page>, query: impl AsRef<str>) -> Result<String
         .append_pair("tweet_search_mode", "live")
         .append_pair("q", query.as_ref());
 
+    if let Some(cursor) = cursor {
+        url.query_pairs_mut().append_pair("cursor", cursor);
+    }
+
     page.goto(url.as_str()).await?;
     page.wait_for_navigation().await?;
     let content = page.content().await?;
@@ -213,15 +281,18 @@ async fn query_twitter(page: Arc<Page>, query: impl AsRef<str>) -> Result<String
         .as_str()
         .to_owned();
 
-    Ok(json)
+    let value = serde_json::from_str(&json)?;
+    parse_tweets(value)
 }
 
-fn parse_tweets(json: Value) -> Result<Vec<Value>> {
+fn parse_tweets(json: Value) -> Result<(Vec<Value>, String)> {
     #[derive(Deserialize)]
     #[serde(rename_all = "camelCase")]
     struct Root {
         global_objects: GlobalObjects,
+        timeline: Value,
     }
+
     #[derive(Deserialize)]
     struct GlobalObjects {
         tweets: HashMap<String, Value>,
@@ -230,9 +301,9 @@ fn parse_tweets(json: Value) -> Result<Vec<Value>> {
 
     let root: Root = serde_json::from_value(json)?;
 
+    // Add user object to every tweet
     let mut tweets = root.global_objects.tweets;
     let users = root.global_objects.users;
-
     for (_, tweet) in tweets.iter_mut() {
         if let Some(tweet) = tweet.as_object_mut() {
             if let Some(user_id_str) = tweet["user_id_str"].as_str() {
@@ -242,7 +313,18 @@ fn parse_tweets(json: Value) -> Result<Vec<Value>> {
             }
         }
     }
-
     let tweets: Vec<_> = tweets.into_iter().map(|(_, tweet)| tweet).collect();
-    Ok(tweets)
+
+    // Parse cursor
+    let timeline_str = serde_json::to_string(&root.timeline)?;
+    let cursor_re = regex::Regex::new(r#""(scroll:.+?)""#)?;
+    let cursor = cursor_re
+        .captures(&timeline_str)
+        .ok_or_else(|| anyhow!("cursor not found"))?
+        .get(1)
+        .unwrap()
+        .as_str()
+        .to_owned();
+
+    Ok((tweets, cursor))
 }
