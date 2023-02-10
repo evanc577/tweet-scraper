@@ -2,22 +2,21 @@ use std::collections::{BTreeMap, VecDeque};
 use std::sync::Arc;
 use std::time::Duration;
 
-use anyhow::{anyhow, Result};
 use chromiumoxide::cdp::browser_protocol::network::{Cookie, SetUserAgentOverrideParams};
 use chromiumoxide::{Browser, BrowserConfig};
 use futures_util::stream::StreamExt;
 use futures_util::Stream;
+use once_cell::sync::Lazy;
 use reqwest::header::{self, HeaderMap, HeaderValue};
 use reqwest::{Client, StatusCode};
 use serde::Deserialize;
 use serde_json::Value;
 use url::Url;
-use once_cell::sync::Lazy;
+
+use crate::error::Error;
 
 pub struct TweetScraper {
-    #[allow(dead_code)]
     client: Client,
-
     fetch_state: FetchState,
 }
 
@@ -43,7 +42,7 @@ static ACCEPT_VALUE: &str = "text/html,application/xhtml+xml,application/xml;q=0
 static AUTHORIZATION_VALUE: &str = "Bearer AAAAAAAAAAAAAAAAAAAAANRILgAAAAAAnNwIzUejRCOuH5E6I8xnZz4puTs%3D1Zv7ttfk8LF81IUq16cHjhLTvJu4FA33AGWWjCpTnA";
 
 impl TweetScraper {
-    pub async fn initialize() -> Result<Self> {
+    pub async fn initialize() -> Result<Self, Error> {
         let browser_data = browser_data().await?;
         let headers = {
             let mut headers = HeaderMap::new();
@@ -68,9 +67,12 @@ impl TweetScraper {
                 .cookies
                 .iter()
                 .find(|c| c.name == "gt")
-                .ok_or_else(|| anyhow!("no guest token"))?
+                .ok_or_else(|| Error::NoGuestToken)?
                 .value;
-            headers.insert("x-guest-token", HeaderValue::from_str(guest_token)?);
+            headers.insert(
+                "x-guest-token",
+                HeaderValue::from_str(guest_token).map_err(|_| Error::InvalidGuestToken)?,
+            );
             headers
         };
         let client = Client::builder()
@@ -79,19 +81,20 @@ impl TweetScraper {
             .gzip(true)
             .brotli(true)
             .deflate(true)
-            .build()?;
+            .build()
+            .map_err(|_| Error::Internal("could not build reqwest client".into()))?;
         Ok(Self {
             client,
             fetch_state: Default::default(),
         })
     }
 
-    pub async fn tweets<'a>(
-        &'a mut self,
+    pub async fn tweets(
+        &mut self,
         query: impl AsRef<str>,
         limit: Option<usize>,
         min_id: Option<u128>,
-    ) -> impl Stream<Item = Result<Value>> + 'a {
+    ) -> impl Stream<Item = Result<Value, Error>> + '_ {
         // Reset internal state
         self.fetch_state = FetchState {
             query: query.as_ref().to_owned(),
@@ -116,11 +119,12 @@ impl TweetScraper {
             let mut should_return_tweet = |tweet| {
                 // Stop if minimum tweet id reached
                 if let Some(min_id) = state.fetch_state.min_id {
-                    let parse_id = |tweet: &Value| -> Result<u128> {
+                    let parse_id = |tweet: &Value| -> Result<u128, Error> {
                         let id = tweet["id_str"]
                             .as_str()
-                            .ok_or_else(|| anyhow!("no id_str"))?
-                            .parse()?;
+                            .ok_or_else(|| Error::TweetParse("no id_str key".into()))?
+                            .parse()
+                            .map_err(|e| Error::TweetParse(format!("invalid id_str: {e}")))?;
                         Ok(id)
                     };
                     match parse_id(&tweet) {
@@ -179,15 +183,16 @@ impl TweetScraper {
 }
 
 /// Get cookies for twitter.com
-async fn browser_data() -> Result<BrowserData> {
+async fn browser_data() -> Result<BrowserData, Error> {
     let (mut browser, mut handler) = Browser::launch(
         BrowserConfig::builder()
             // Sometimes twitter webpage hangs if window is larger???
             .window_size(800, 600)
             .build()
-            .map_err(|s| anyhow!(s))?,
+            .map_err(Error::Internal)?,
     )
-    .await?;
+    .await
+    .map_err(Error::Cdp)?;
 
     let browser_handler =
         tokio::task::spawn(async move { while handler.next().await.is_some() {} });
@@ -195,22 +200,27 @@ async fn browser_data() -> Result<BrowserData> {
     let page = Arc::new(
         browser
             .start_incognito_context()
-            .await?
+            .await
+            .map_err(Error::Cdp)?
             .new_page("about:blank")
-            .await?,
+            .await
+            .map_err(Error::Cdp)?,
     );
 
     page.set_user_agent(SetUserAgentOverrideParams::new(USER_AGENT))
-        .await?;
+        .await
+        .map_err(Error::Cdp)?;
 
     // Navigate to website to extract cookies
-    page.goto("https://twitter.com/explore").await?;
-    page.wait_for_navigation().await?;
+    page.goto("https://twitter.com/explore")
+        .await
+        .map_err(Error::Cdp)?;
+    page.wait_for_navigation().await.map_err(Error::Cdp)?;
 
-    let cookies = page.get_cookies().await?;
+    let cookies = page.get_cookies().await.map_err(Error::Cdp)?;
 
-    browser.close().await?;
-    browser_handler.await?;
+    browser.close().await.map_err(Error::Cdp)?;
+    _ = browser_handler.await;
 
     Ok(BrowserData { cookies })
 }
@@ -219,10 +229,10 @@ async fn query_twitter(
     client: &Client,
     query: impl AsRef<str>,
     cursor: Option<&str>,
-) -> Result<(Vec<Value>, String)> {
+) -> Result<(Vec<Value>, String), Error> {
     static URL: &str = "https://api.twitter.com/2/search/adaptive.json";
 
-    let mut url = Url::parse(URL)?;
+    let mut url = Url::parse(URL).map_err(|_| Error::Internal("could not parse api url".into()))?;
     url.query_pairs_mut()
         .clear()
         .append_pair("include_profile_interstitial_type", "1")
@@ -258,27 +268,36 @@ async fn query_twitter(
         url.query_pairs_mut().append_pair("cursor", cursor);
     }
 
-    static RETRY_STATUS: Lazy<Vec<StatusCode>> = Lazy::new(|| {
-        [StatusCode::TOO_MANY_REQUESTS, StatusCode::REQUEST_TIMEOUT].into()
-    });
+    static RETRY_STATUS: Lazy<Vec<StatusCode>> =
+        Lazy::new(|| [StatusCode::TOO_MANY_REQUESTS, StatusCode::REQUEST_TIMEOUT].into());
     let json = loop {
-        let response = client.get(url.as_str()).send().await?;
+        let response = client
+            .get(url.as_str())
+            .send()
+            .await
+            .map_err(|e| Error::Network(e.to_string()))?;
         if response.status().is_success() {
-            break response.json::<Value>().await?;
+            break response
+                .json::<Value>()
+                .await
+                .map_err(|e| Error::TweetParse(e.to_string()))?;
         }
 
         if response.status().is_server_error() || RETRY_STATUS.contains(&response.status()) {
-            eprintln!("received response status code: {}, waiting 60 seconds", response.status().as_u16());
+            eprintln!(
+                "received response status code: {}, waiting 60 seconds",
+                response.status().as_u16()
+            );
             tokio::time::sleep(Duration::from_secs(60)).await;
         } else {
-            return Err(anyhow!("error status code {}", response.status().as_u16()));
+            return Err(Error::BadStatus(response.status().as_u16()));
         }
     };
 
     parse_tweets(json)
 }
 
-fn parse_tweets(json: Value) -> Result<(Vec<Value>, String)> {
+fn parse_tweets(json: Value) -> Result<(Vec<Value>, String), Error> {
     #[derive(Deserialize)]
     #[serde(rename_all = "camelCase")]
     struct Root {
@@ -292,7 +311,7 @@ fn parse_tweets(json: Value) -> Result<(Vec<Value>, String)> {
         users: BTreeMap<String, Value>,
     }
 
-    let root: Root = serde_json::from_value(json)?;
+    let root: Root = serde_json::from_value(json).map_err(|e| Error::TweetParse(e.to_string()))?;
 
     // Add user object to every tweet
     let mut tweets = root.global_objects.tweets;
@@ -306,14 +325,16 @@ fn parse_tweets(json: Value) -> Result<(Vec<Value>, String)> {
             }
         }
     }
-    let tweets: Vec<_> = tweets.into_iter().map(|(_, tweet)| tweet).rev().collect();
+    let tweets: Vec<_> = tweets.into_values().rev().collect();
 
     // Parse cursor
-    let timeline_str = serde_json::to_string(&root.timeline)?;
-    let cursor_re = regex::Regex::new(r#""(scroll:.+?)""#)?;
+    let timeline_str =
+        serde_json::to_string(&root.timeline).map_err(|e| Error::TweetParse(e.to_string()))?;
+    let cursor_re = regex::Regex::new(r#""(scroll:.+?)""#)
+        .map_err(|_| Error::Internal("could not build regex".into()))?;
     let cursor = cursor_re
         .captures(&timeline_str)
-        .ok_or_else(|| anyhow!("cursor not found"))?
+        .ok_or_else(|| Error::TweetParse("could not find cursor".into()))?
         .get(1)
         .unwrap()
         .as_str()

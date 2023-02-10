@@ -1,4 +1,4 @@
-use std::io::{self, Write};
+use std::{io::{self, Write}, process::ExitCode};
 
 use clap::Parser;
 use futures_util::stream::StreamExt;
@@ -16,19 +16,32 @@ struct Args {
 }
 
 #[tokio::main]
-async fn main() {
+async fn main() -> ExitCode {
     let args = Args::parse();
 
-    let mut scraper = TweetScraper::initialize().await.unwrap();
+    let mut scraper = match TweetScraper::initialize().await {
+        Ok(s) => s,
+        Err(e) => {
+            eprintln!("{}", e);
+            return ExitCode::FAILURE;
+        }
+    };
+
     let tweets_stream = scraper.tweets(args.query, args.limit, args.min_id).await;
     futures_util::pin_mut!(tweets_stream);
+
     while let Some(tweet_result) = tweets_stream.next().await {
         let tweet = tweet_result.unwrap();
         if let Err(e) = writeln!(io::stdout(), "{}", serde_json::to_string(&tweet).unwrap()) {
             match e.kind() {
                 io::ErrorKind::BrokenPipe => break,
-                _ => Err(e).unwrap(),
+                _ => {
+                    eprintln!("e");
+                    return ExitCode::FAILURE;
+                }
             }
         }
     }
+
+    ExitCode::SUCCESS
 }
