@@ -1,4 +1,5 @@
 use std::collections::{BTreeMap, VecDeque};
+use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -14,10 +15,17 @@ use serde_json::Value;
 use url::Url;
 
 use crate::error::Error;
+use crate::header_persist::{load_headers, save_headers, PersistHeadersError};
 
 pub struct TweetScraper {
     client: Client,
     fetch_state: FetchState,
+}
+
+pub enum HeaderPersist {
+    Load(PathBuf),
+    Save(PathBuf),
+    None,
 }
 
 // State during stream iteration
@@ -42,9 +50,16 @@ static ACCEPT_VALUE: &str = "text/html,application/xhtml+xml,application/xml;q=0
 static AUTHORIZATION_VALUE: &str = "Bearer AAAAAAAAAAAAAAAAAAAAANRILgAAAAAAnNwIzUejRCOuH5E6I8xnZz4puTs%3D1Zv7ttfk8LF81IUq16cHjhLTvJu4FA33AGWWjCpTnA";
 
 impl TweetScraper {
-    pub async fn initialize() -> Result<Self, Error> {
-        let browser_data = browser_data().await?;
-        let headers = {
+    pub async fn initialize(header_persist: HeaderPersist) -> Result<Self, Error> {
+        // If requested, load headers from file, otherwise spawn chromium process to get headers
+        let headers = if let HeaderPersist::Load(p) = &header_persist {
+            // Load headers from file
+            load_headers(&p)
+                .await
+                .map_err(|e| Error::PersistHeaders(PersistHeadersError::Load(e, p.clone())))?
+        } else {
+            // Load headers from chromium
+            let browser_data = browser_data().await?;
             let mut headers = HeaderMap::new();
             headers.insert(header::ACCEPT, HeaderValue::from_static(ACCEPT_VALUE));
             headers.insert(
@@ -73,16 +88,25 @@ impl TweetScraper {
                 "x-guest-token",
                 HeaderValue::from_str(guest_token).map_err(|_| Error::InvalidGuestToken)?,
             );
+            headers.insert(header::USER_AGENT, HeaderValue::from_static(USER_AGENT));
             headers
         };
+
+        // Save headers
+        if let HeaderPersist::Save(p) = &header_persist {
+            save_headers(&headers, &p)
+                .await
+                .map_err(|e| Error::PersistHeaders(PersistHeadersError::Save(e, p.clone())))?;
+        }
+
         let client = Client::builder()
-            .user_agent(USER_AGENT)
             .default_headers(headers)
             .gzip(true)
             .brotli(true)
             .deflate(true)
             .build()
             .map_err(|_| Error::Internal("could not build reqwest client".into()))?;
+
         Ok(Self {
             client,
             fetch_state: Default::default(),

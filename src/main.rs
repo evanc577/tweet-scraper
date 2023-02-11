@@ -1,8 +1,10 @@
-use std::{io::{self, Write}, process::ExitCode};
+use std::io::{self, Write};
+use std::path::PathBuf;
+use std::process::ExitCode;
 
 use clap::Parser;
 use futures_util::stream::StreamExt;
-use tweet_scraper::TweetScraper;
+use tweet_scraper::{HeaderPersist, TweetScraper};
 
 #[derive(Parser)]
 struct Args {
@@ -13,13 +15,27 @@ struct Args {
 
     #[arg(short, long)]
     min_id: Option<u128>,
+
+    #[arg(long)]
+    save_headers: Option<PathBuf>,
+
+    #[arg(long, conflicts_with = "save_headers")]
+    load_headers: Option<PathBuf>,
 }
 
 #[tokio::main]
 async fn main() -> ExitCode {
     let args = Args::parse();
 
-    let mut scraper = match TweetScraper::initialize().await {
+    let header_persist = if let Some(save) = args.save_headers {
+        HeaderPersist::Save(save)
+    } else if let Some(load) = args.load_headers {
+        HeaderPersist::Load(load)
+    } else {
+        HeaderPersist::None
+    };
+
+    let mut scraper = match TweetScraper::initialize(header_persist).await {
         Ok(s) => s,
         Err(e) => {
             eprintln!("{}", e);

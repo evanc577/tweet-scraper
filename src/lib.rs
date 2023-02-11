@@ -1,4 +1,5 @@
 mod error;
+mod header_persist;
 mod scraper;
 
-pub use scraper::TweetScraper;
+pub use scraper::{HeaderPersist, TweetScraper};

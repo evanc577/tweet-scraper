@@ -2,6 +2,8 @@ use std::fmt::Display;
 
 use chromiumoxide::error::CdpError;
 
+use crate::header_persist::PersistHeadersError;
+
 #[derive(Debug)]
 pub enum Error {
     Internal(String),
@@ -11,6 +13,7 @@ pub enum Error {
     TweetParse(String),
     BadStatus(u16),
     Network(String),
+    PersistHeaders(PersistHeadersError),
 }
 
 impl Display for Error {
@@ -23,6 +26,7 @@ impl Display for Error {
             Self::TweetParse(s) => write!(f, "could not parse tweet: {}", s),
             Self::BadStatus(c) => write!(f, "api returned status code: {}", c),
             Self::Network(s) => write!(f, "network error: {}", s),
+            Self::PersistHeaders(e) => write!(f, "{}", e),
         }
     }
 }
